@@ -214,48 +214,48 @@ def build_inputs(
     prompt: Optional[str] = None,
     max_input_tokens: int = 2048,
     reserve_tokens: int = 64,
-) -> Tuple[Dict[str, torch.Tensor], int, bool]:
+) -> Tuple[Dict[str, Any], int, bool, int]:
     """
-    Tokenize inputs for generation, respecting a token budget.
-    - If `messages` provided and chat template supported → use chat template.
-    - Else, use plain prompt (either `prompt` arg or a simple system/user fallback).
-    Returns: (tokenized_inputs, used_max_len, used_chat_template)
+    Returns: (encoded_inputs, used_cap, used_chat_template, original_tokens_untruncated)
     """
     tokenizer = handle.tokenizer
     model = handle.model
 
-    # Effective cap: don't exceed the model's context window
-    effective_cap = max(64, min(int(max_input_tokens), int(handle.context_tokens) - int(reserve_tokens)))
-
+    # 1) Build the exact string fed to the model
+    used_chat = False
     if messages and handle.supports_chat_template:
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        used_chat = True
+        prompt_str = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,  # ensures assistant header for causal LMs
+        )
     else:
-        # plain fallback
-        if messages and not prompt:
-            # Build a minimal plain-text fallback from the last system+user turns
-            system_parts = [m["content"] for m in messages if m.get("role") == "system"]
-            user_parts = [m["content"] for m in messages if m.get("role") == "user"]
-            system_text = system_parts[-1] if system_parts else ""
-            user_text = user_parts[-1] if user_parts else ""
-            text = f"<<SYSTEM>>\n{system_text}\n\n<<USER>>\n{user_text}\n\n<<ASSISTANT>>\n"
+        # Plain fallback that avoids literal "system/user" prefixes being echoed
+        if messages:
+            sys = next((m["content"] for m in messages if m.get("role") == "system"), "")
+            usr = "\n\n".join(m["content"] for m in messages if m.get("role") == "user")
+            prompt_str = (f"{sys}\n\n{usr}\n\nAssistant:").strip()
         else:
-            text = prompt or ""
+            prompt_str = (prompt or "").strip()
 
+    # 2) Count-only pass (true length, no truncation)
+    original_ids = tokenizer.encode(prompt_str, add_special_tokens=False, truncation=False)
+    original_tokens_untruncated = len(original_ids)
+
+    # 3) Truncated encode for actual generation
+    cap = max(8, min(int(max_input_tokens), int(handle.context_tokens) - int(reserve_tokens)))
     enc = tokenizer(
-        text,
+        prompt_str,
         return_tensors="pt",
         truncation=True,
-        max_length=effective_cap,
+        max_length=cap,
         padding=False,
     )
+    if hasattr(model, "device") and getattr(model.device, "type", None) == "cuda":
+        enc = {k: v.to(model.device) for k, v in enc.items()}
 
-    # Move to model's primary device when available
-    target_device = getattr(model, "device", None)
-    if target_device is not None:
-        enc = {k: v.to(target_device) for k, v in enc.items()}
-
-    used_chat = bool(messages and handle.supports_chat_template)
-    return enc, effective_cap, used_chat
+    return enc, cap, used_chat, original_tokens_untruncated
 
 
 def generate_text(
@@ -266,10 +266,6 @@ def generate_text(
     max_input_tokens: int = 2048,
     max_new_tokens: int = 256,
     reserve_tokens: int = 64,
-    do_sample: bool = False,
-    temperature: float = 0.7,
-    top_p: float = 0.9,
-    num_beams: int = 1,
     return_meta: bool = False,
 ) -> str | Tuple[str, Dict[str, Any]]:
     """
@@ -280,7 +276,7 @@ def generate_text(
     tokenizer = handle.tokenizer
     model = handle.model
 
-    enc, used_cap, used_chat = build_inputs(
+    enc, used_cap, used_chat, original_tokens = build_inputs(
         handle,
         messages=messages,
         prompt=prompt,
@@ -290,12 +286,11 @@ def generate_text(
 
     input_len = enc["input_ids"].shape[1] if "input_ids" in enc else 0
 
-    cap_limit = min(int(max_input_tokens), int(handle.context_tokens) - int(reserve_tokens))
-    cap_hit = input_len >= max(8, cap_limit - 4)  # small margin to avoid off-by-one
-    if cap_hit:
+    if original_tokens > used_cap:
+        over_by = original_tokens - used_cap
         msg = (
             f"(file too large for a single-pass summary — "
-            f"encoded ~{input_len} tokens vs limit ~{cap_limit})."
+            f"prompt was {original_tokens} tokens, limit is {used_cap}; over by {over_by}.)"
         )
         if return_meta:
             meta = {
@@ -303,10 +298,10 @@ def generate_text(
                 "used_chat_template": used_chat,
                 "input_cap_tokens": used_cap,
                 "context_tokens": handle.context_tokens,
-                "sampling": {"do_sample": do_sample, "temperature": temperature, "top_p": top_p, "num_beams": num_beams},
-                "truncated": True,
+                "original_tokens": original_tokens,
+                "truncated": False,
             }
-            return msg, meta
+            return text, meta
         return msg
 
     # Required ids
@@ -315,15 +310,9 @@ def generate_text(
 
     gen_kwargs = dict(
         max_new_tokens=int(max_new_tokens),
-        num_beams=int(num_beams),
-        do_sample=bool(do_sample),
         eos_token_id=eos_id,
         pad_token_id=pad_id,
     )
-
-    # Only include sampling controls when sampling is enabled; avoids “ignored flags” warnings
-    if do_sample:
-        gen_kwargs.update(temperature=float(temperature), top_p=float(top_p))
 
     output_ids = model.generate(**enc, **gen_kwargs)
 
@@ -336,7 +325,6 @@ def generate_text(
             "used_chat_template": used_chat,
             "input_cap_tokens": used_cap,
             "context_tokens": handle.context_tokens,
-            "sampling": {"do_sample": do_sample, "temperature": temperature, "top_p": top_p, "num_beams": num_beams},
         }
         return text, meta
     return text

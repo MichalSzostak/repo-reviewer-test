@@ -137,8 +137,6 @@ def _summarise_one_file(file_path: str, text: str, model: LoadedModel, *, max_in
         messages=_summary_messages(file_path, text),
         max_input_tokens=int(max_in),
         max_new_tokens=int(max_out),
-        do_sample=False,
-        num_beams=1,
     )
 
 
@@ -158,8 +156,6 @@ def _make_summaries_block(summaries: list[dict]) -> str:
 # Gradio callbacks
 # -----------------------------
 
-from core.repo_fetcher import clone_or_update_repo, list_remote_branches, detect_default_branch
-
 def on_clone_click(url: str, selected_branch: str | None, force_fresh: bool):
     if not url or not url.strip():
         return (
@@ -175,7 +171,7 @@ def on_clone_click(url: str, selected_branch: str | None, force_fresh: bool):
         res = clone_or_update_repo(
             repo_url,
             branch=branch_to_use,
-            force_fresh=bool(force_fresh),  # ← NEW
+            force_fresh=bool(force_fresh),
         )
 
         branches = list_remote_branches(repo_url)
@@ -348,8 +344,6 @@ def on_ticket_reason_click(
             messages=_reasoning_messages(ticket_text.strip(), summaries_block),
             max_input_tokens=int(max_in),
             max_new_tokens=int(max_out),
-            do_sample=False,
-            num_beams=1,
         )
         header = f"**Reasoner model:** `{handle.model_id}`"
         return gr.update(value=f"{header}\n\n{answer}")
@@ -478,7 +472,7 @@ with gr.Blocks(title="Repo Explainer") as demo:
     # Wire clone
     clone_event = clone_btn.click(
         fn=on_clone_click,
-        inputs=[url, branch_dd],
+        inputs=[url, branch_dd, force_fresh_cb],
         outputs=[clone_status, tree_md, repo_dir_state, branch_dd],
     )
 
@@ -536,18 +530,11 @@ with gr.Blocks(title="Repo Explainer") as demo:
         summarise_repo_btn = gr.Button("Summarise repo")
     summarise_report_md = gr.Markdown()
     summaries_md = gr.Markdown()
-    save_summaries_btn = gr.Button("Save summaries")
-    save_summaries_status = gr.Markdown()
 
     summarise_repo_btn.click(
         fn=on_summarise_repo_click,
         inputs=[repo_dir_state, max_files_to_summarise, max_input_tokens, max_new_tokens, overlap_tokens, models_state],
         outputs=[summaries_state, summarise_report_md, summaries_md],
-    )
-    save_summaries_btn.click(
-        fn=on_save_summaries_click,
-        inputs=[summaries_state],
-        outputs=[save_summaries_status],
     )
 
     gr.Markdown("---")
@@ -562,38 +549,6 @@ with gr.Blocks(title="Repo Explainer") as demo:
         fn=on_ticket_reason_click,
         inputs=[ticket_text, summaries_state, models_state, max_input_tokens, max_new_tokens],
         outputs=[reason_md],
-    )
-
-    gr.Markdown("---")
-
-    # --- Diagnostics ---
-    gr.Markdown("## Diagnostics")
-    diag_btn = gr.Button("Analyze selected file")
-    diag_md = gr.Markdown()
-
-    diag_btn.click(
-        fn=on_diagnostics_click,
-        inputs=[repo_dir_state, files_dropdown, max_input_tokens, overlap_tokens, models_state],
-        outputs=[diag_md],
-    )
-
-    gr.Markdown("---")
-
-    # --- Single-file summary + save ---
-    summarise_btn = gr.Button("Summarise selected file", variant="primary")
-    summary_md = gr.Markdown()
-    save_btn = gr.Button("Save summary")
-    save_status = gr.Markdown()
-
-    summarise_btn.click(
-        fn=on_summarize_click,
-        inputs=[repo_dir_state, files_dropdown, max_input_tokens, max_new_tokens, overlap_tokens, models_state],
-        outputs=[summary_md],
-    )
-    save_btn.click(
-        fn=on_save_summary_click,
-        inputs=[repo_dir_state, files_dropdown, summary_md],
-        outputs=[save_status],
     )
 
 if __name__ == "__main__":
