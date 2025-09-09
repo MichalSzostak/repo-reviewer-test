@@ -5,10 +5,6 @@ from typing import List, Dict
 
 
 def list_text_files(root: str, max_files: int = 5000) -> List[str]:
-    """
-    Return a list of relative paths for likely-text files under `root`.
-    Keep this minimal: just an extension allowlist and a few ignores.
-    """
     allow_ext = {
         ".py", ".yaml", ".yml",
     }

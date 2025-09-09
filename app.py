@@ -2,154 +2,18 @@ from __future__ import annotations
 
 import os
 import time
-from typing import List, Dict
 
 import gradio as gr
-from rich.tree import Tree
+
 from rich.console import Console
 
+import core.util as util
+from core.model_manager import get_or_load_model, generate_text, LoadedModel
 from core.repo_fetcher import clone_or_update_repo, list_remote_branches, detect_default_branch
 from core.repo_scanner import list_text_files, read_for_preview, lang_from_path, read_text_file, choose_bucket
-from core.model_manager import get_or_load_model, generate_text, LoadedModel
+
 
 console = Console(record=True)
-
-# -----------------------------
-# Small helpers
-# -----------------------------
-
-def summaries_to_markdown(summaries: List[Dict]) -> str:
-    """
-    Render per-file summaries into a single Markdown doc grouped by directory.
-
-    Expected item shape (bucket/model optional):
-      {
-        "path": "core/utils.py",
-        "summary": "- bullet\n- bullet",
-        "bucket": "python",
-        "model": "Qwen/Qwen2.5-3B-Instruct"
-      }
-
-    Returns a markdown string safe to pass to gr.Markdown(value=...).
-    """
-    if not summaries:
-        return "# Repo summaries\n\n(none)\n"
-
-    items = sorted(summaries, key=lambda s: s.get("path", ""))
-
-    lines = ["# Repo summaries", ""]
-    current_dir = None
-
-    for item in items:
-        path = item.get("path", "")
-        directory = os.path.dirname(path) or "."
-        name = os.path.basename(path) or path
-        summary = (item.get("summary") or "").strip()
-        bucket = item.get("bucket")
-        model = item.get("model")
-
-        # Start a new directory section if needed
-        if directory != current_dir:
-            if current_dir is not None:
-                lines.append("")  # spacing between sections
-            lines.append(f"## {directory}")
-            lines.append("")
-            current_dir = directory
-
-        # File header with optional meta
-        meta_bits = []
-        if bucket:
-            meta_bits.append(f"`{bucket}`")
-        if model:
-            meta_bits.append(f"`{model}`")
-        meta = (" — " + " · ".join(meta_bits)) if meta_bits else ""
-        lines.append(f"### {name}{meta}")
-
-        # Body: include summary exactly as produced (no post-processing here)
-        if summary:
-            for ln in summary.splitlines():
-                lines.append(ln.rstrip())
-        else:
-            lines.append("_(no summary)_")
-
-        lines.append("")  # blank line after each file
-
-    return "\n".join(lines)
-
-def render_top_level(repo_dir: str, entries: list[str]) -> str:
-    tree = Tree(f"[bold cyan]{os.path.basename(repo_dir)}[/]  (top-level)")
-    for e in entries:
-        if e.endswith("/"):
-            tree.add(f"[yellow]{e}[/]")
-        else:
-            tree.add(e)
-    console.clear()
-    console.print(tree)
-    ansi = console.export_text(clear=False)
-    return f"```\n{ansi}\n```"
-
-
-def _summary_messages(file_path: str, file_text: str):
-    """
-    Strict bullet-only prompt. Keeps model from echoing code or instructions.
-    """
-    system = (
-        "You are a senior engineer. Return 3–5 concise bullets (each starting with '- '). "
-        "Focus on: purpose, key entry points/APIs, libraries explicitly imported in THIS file, and cross-file ties ONLY if visible. "
-        "Do NOT restate the request. Do NOT copy code or identifiers. Do NOT include CLI or install steps. "
-        "If something is not evident from THIS file, write 'not evident'."
-    )
-    user = (
-        f"File path: {file_path}\n\n"
-        f"<file>\n{file_text}\n</file>\n\n"
-        "- "
-    )
-    return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
-
-
-def _reasoning_messages(ticket_text: str, summaries_block: str):
-    system = (
-        "Produce exactly three Markdown sections and nothing else:\n"
-        "# What to read first (top files)\n"
-        "List 3–5 file paths. For each: a one-sentence rationale (why it matters for the ticket) "
-        "followed by 1–3 short bullets adapted from its summary (no code/CLI).\n"
-        "# Prerequisites\n"
-        "3–6 bullets of topics/libraries/services a contributor should review.\n"
-        "# Work plan\n"
-        "3–7 concrete steps; call out risks where relevant.\n"
-        "Rules: Do NOT repeat or quote the ticket. Do NOT ask questions. Be concise."
-    )
-    user = f"Ticket:\n{ticket_text}\n\nFile summaries:\n{summaries_block}\n"
-    return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
-
-
-def _summarise_one_file(file_path: str, text: str, model: LoadedModel, *, max_in: int, max_out: int) -> str:
-    # Single call through the unified generator
-    return generate_text(
-        model,
-        messages=_summary_messages(file_path, text),
-        max_input_tokens=int(max_in),
-        max_new_tokens=int(max_out),
-    )
-
-
-def _make_summaries_block(summaries: list[dict]) -> str:
-    """
-    Compact, plain block for the reasoner: 'File: path\n<bullets>\n'
-    """
-    parts = []
-    for item in summaries:
-        path = item.get("path", "???")
-        summ = (item.get("summary") or "").strip()
-        if summ:
-            parts.append(f"File: {path}\n{summ}\n")
-    return "\n".join(parts).strip()
 
 # -----------------------------
 # Gradio callbacks
@@ -185,8 +49,7 @@ def on_clone_click(url: str, selected_branch: str | None, force_fresh: bool):
             f"- Reused existing: `{res.reused_existing}`  \n"
             f"- Took: `{res.took_sec}s`"
         )
-        tree_md = render_top_level(res.repo_dir, res.top_level)
-
+        tree_md = util.render_repo_tree(res.repo_dir, max_depth=4, per_dir_limit=200)
         return gr.update(value=msg), gr.update(value=tree_md), res.repo_dir, branch_update
 
     except Exception as e:
@@ -271,7 +134,7 @@ def on_summarise_repo_click(
     t0 = time.time()
     taken = 0
     for idx, rel in enumerate(files, start=1):
-        yield summaries, gr.update(value=f"Summarizing **{rel}** ({idx} of {total})…"), gr.update(value=summaries_to_markdown(summaries))
+        yield summaries, gr.update(value=f"Summarizing **{rel}** ({idx} of {total})…"), gr.update(value=util.summaries_to_markdown(summaries))
         if taken >= int(max_files):
             break
 
@@ -290,7 +153,7 @@ def on_summarise_repo_click(
         handle: LoadedModel = (models_state.get(bucket) or models_state.get("text") or models_state.get("python"))
 
         try:
-            s = _summarise_one_file(rel, text, handle, max_in=max_in, max_out=max_out)
+            s = util._summarise_one_file(rel, text, handle, max_in=max_in, max_out=max_out)
         except Exception as e:
             s = f"(summary error: {e})"
 
@@ -308,7 +171,7 @@ def on_summarise_repo_click(
     if len(summaries) > 10:
         report.append("...")
     took = round(time.time() - t0, 2)
-    yield summaries, gr.update(value=f"Done. Summarised {len(summaries)} file(s) in {took}s."), gr.update(value=summaries_to_markdown(summaries))
+    yield summaries, gr.update(value=f"Done. Summarised {len(summaries)} file(s) in {took}s."), gr.update(value=util.summaries_to_markdown(summaries))
 
 def on_save_summaries_click(summaries: list | None):
     if not summaries:
@@ -316,7 +179,7 @@ def on_save_summaries_click(summaries: list | None):
     os.makedirs("./out", exist_ok=True)
     out_path = os.path.abspath("./out/repo_summaries.md")
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write(summaries_to_markdown(summaries))
+        f.write(util.summaries_to_markdown(summaries))
     return gr.update(value=f"Saved: `{out_path}`")
 
 
@@ -336,11 +199,11 @@ def on_ticket_reason_click(
     # Use the general text model by default for reasoning
     handle: LoadedModel = (models_state.get("text") or models_state.get("python"))
 
-    summaries_block = _make_summaries_block(summaries)
+    summaries_block = util._make_summaries_block(summaries)
     try:
         answer = generate_text(
             handle,
-            messages=_reasoning_messages(ticket_text.strip(), summaries_block),
+            messages=util._reasoning_messages(ticket_text.strip(), summaries_block),
             max_input_tokens=int(max_in),
             max_new_tokens=int(max_out),
         )
@@ -367,7 +230,7 @@ def on_summarize_click(
     handle: LoadedModel = (models_state.get(bucket) or models_state.get("text") or models_state.get("python"))
 
     try:
-        summary = _summarise_one_file(rel_path, text, handle, max_in=max_in, max_out=max_out)
+        summary = util._summarise_one_file(rel_path, text, handle, max_in=max_in, max_out=max_out)
         header = f"**Model:** `{handle.model_id}` | **Bucket:** `{bucket}` | **File:** `{rel_path}`"
         return gr.update(value=f"{header}\n\n{summary}")
     except Exception as e:
@@ -386,54 +249,6 @@ def on_save_summary_click(repo_dir: str | None, rel_path: str | None, summary_md
         return gr.update(value=f"Saved: `{out_path}`")
     except Exception as e:
         return gr.update(value=f"**Save error:** {e}")
-
-
-def on_diagnostics_click(
-    repo_dir: str | None,
-    rel_path: str | None,
-    max_in: int, overlap: int,
-    models_state: dict | None
-):
-    if not (repo_dir and rel_path):
-        return gr.update(value="(clone and select a file)")
-    if not models_state:
-        return gr.update(value="(load models first)")
-
-    abspath = os.path.join(repo_dir, rel_path)
-    try:
-        with open(abspath, "r", encoding="utf-8", errors="ignore") as f:
-            text = f.read()
-            bucket = choose_bucket(rel_path, text)
-            handle: LoadedModel = (models_state.get(bucket) or models_state.get("text") or models_state.get("python"))
-    except Exception as e:
-        return gr.update(value=f"Error reading file: {e}")
-
-    # Tokenization plan uses the chosen model's tokenizer
-    plan = chunk_plan(text, handle.tokenizer, max_tokens=int(max_in), overlap=int(overlap))
-    gpu = gpu_memory_info()
-
-    lang = lang_from_path(rel_path)
-    md = []
-    md.append(f"**File:** `{rel_path}`")
-    md.append(f"**Language:** `{lang}`")
-    md.append(f"**Model:** `{handle.model_id}`")
-    md.append("")
-    md.append("### Tokenization")
-    md.append(f"- Total tokens in file: **{plan['total_tokens']}**")
-    md.append(f"- Chunk window: **{int(max_in)}** tokens, overlap: **{int(overlap)}**")
-    md.append(f"- Number of chunks planned: **{plan['num_chunks']}**")
-    if plan["num_chunks"] > 0:
-        sizes = [c["size"] for c in plan["chunks"]]
-        md.append(f"- Chunk sizes (first 10): {sizes[:10]}")
-    md.append("")
-    md.append("### GPU memory (best-effort)")
-    if gpu["available"]:
-        md.append(f"- Allocated: **{gpu['current_mb']} MB**")
-        md.append(f"- Reserved: **{gpu['reserved_mb']} MB**")
-        md.append(f"- Total: **{gpu['total_mb']} MB**")
-    else:
-        md.append("- CUDA not available (running on CPU or no GPU detected)")
-    return gr.update(value="\n".join(md))
 
 
 # -----------------------------

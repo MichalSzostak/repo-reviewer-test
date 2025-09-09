@@ -152,15 +152,7 @@ def get_or_load_model(
             device_map="auto",
             low_cpu_mem_usage=True,
             cache_dir=cache_dir,
-            dtype=dtype,  # <- use only the modern 'dtype' parameter
-        )
-    except TypeError:
-        model = model_cls.from_pretrained(
-            model_id,
-            device_map="auto",
-            low_cpu_mem_usage=True,
-            cache_dir=cache_dir,
-            torch_dtype=dtype,
+            dtype=dtype
         )
     except Exception as e:
         raise RuntimeError(f"Failed to load model weights for '{model_id}': {e}")
