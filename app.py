@@ -8,7 +8,6 @@ import gradio as gr
 from rich.tree import Tree
 from rich.console import Console
 
-from core.diagnostics import chunk_plan, gpu_memory_info
 from core.repo_fetcher import clone_or_update_repo, list_remote_branches, detect_default_branch
 from core.repo_scanner import list_text_files, read_for_preview, lang_from_path, read_text_file, choose_bucket
 from core.model_manager import get_or_load_model, generate_text, LoadedModel
