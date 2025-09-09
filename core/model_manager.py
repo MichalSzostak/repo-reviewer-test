@@ -290,6 +290,25 @@ def generate_text(
 
     input_len = enc["input_ids"].shape[1] if "input_ids" in enc else 0
 
+    cap_limit = min(int(max_input_tokens), int(handle.context_tokens) - int(reserve_tokens))
+    cap_hit = input_len >= max(8, cap_limit - 4)  # small margin to avoid off-by-one
+    if cap_hit:
+        msg = (
+            f"(file too large for a single-pass summary — "
+            f"encoded ~{input_len} tokens vs limit ~{cap_limit})."
+        )
+        if return_meta:
+            meta = {
+                "model_id": handle.model_id,
+                "used_chat_template": used_chat,
+                "input_cap_tokens": used_cap,
+                "context_tokens": handle.context_tokens,
+                "sampling": {"do_sample": do_sample, "temperature": temperature, "top_p": top_p, "num_beams": num_beams},
+                "truncated": True,
+            }
+            return msg, meta
+        return msg
+
     # Required ids
     eos_id = getattr(tokenizer, "eos_token_id", None)
     pad_id = getattr(tokenizer, "pad_token_id", None)
