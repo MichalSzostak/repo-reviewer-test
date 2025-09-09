@@ -123,37 +123,20 @@ def _detect_default_branch_by_url(url: str) -> str:
             return cand
     return sorted(heads)[0] if heads else "main"
 
-
-def _detect_default_branch_by_url(url: str) -> str:
+def list_remote_branches(url: str) -> list[str]:
     """
-    Detect the remote's default branch by querying origin/HEAD symbolically,
-    without cloning (uses `git ls-remote --symref <url> HEAD`).
-    Falls back to common names, then any head.
+    Public wrapper: return sorted remote branch names (e.g., ['develop','main','release']).
     """
-    from git import Git
-    try:
-        out = Git().ls_remote("--symref", url, "HEAD")
-        # Example first line: "ref: refs/heads/develop HEAD"
-        for line in (out or "").splitlines():
-            line = line.strip()
-            if line.startswith("ref:"):
-                parts = line.split()
-                # parts[1] should be "refs/heads/<branch>"
-                ref = parts[1] if len(parts) > 1 else ""
-                if ref.startswith("refs/heads/"):
-                    return ref.split("/")[-1]
-    except Exception:
-        pass
-
-    # Fallbacks: prefer common names, then any head we can find
-    heads = _remote_heads_by_url(url)
-    for cand in ("main", "master"):
-        if cand in heads:
-            return cand
-    return sorted(heads)[0] if heads else "main"
+    return sorted(_remote_heads_by_url(url))
 
 
-def clone_or_update_repo(url: str, branch: str | None = None) -> CloneResult:
+def detect_default_branch(url: str) -> str:
+    """
+    Public wrapper: return default branch (remote HEAD) or a sensible fallback.
+    """
+    return _detect_default_branch_by_url(url)
+
+def clone_or_update_repo(url: str, branch: str | None = None, *, force_fresh: bool = False) -> CloneResult:
     """
     Clone/update shallowly (depth=1) into a cache path that reflects the *actual* branch.
     Behavior:
@@ -172,6 +155,8 @@ def clone_or_update_repo(url: str, branch: str | None = None) -> CloneResult:
         use_branch = _detect_default_branch_by_url(url)
 
     target = _repo_cache_path_by_branch(url, use_branch)
+    if force_fresh and os.path.isdir(target):
+        shutil.rmtree(target, ignore_errors=True)
     reused_existing = False
 
     try:
